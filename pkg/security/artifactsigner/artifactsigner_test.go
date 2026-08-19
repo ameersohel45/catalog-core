@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/beckn/catalog-core/security/artifactverifier"
+	"github.com/beckn/catalog-core/pkg/security/artifactverifier"
 )
 
 func TestSignDetachedJWS_RoundTripsWithVerifier(t *testing.T) {

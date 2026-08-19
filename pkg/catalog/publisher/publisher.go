@@ -29,9 +29,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/beckn/catalog-core/catalog"
-	"github.com/beckn/catalog-core/catalog/store"
-	"github.com/beckn/catalog-core/security/artifactsigner"
+	"github.com/beckn/catalog-core/pkg/catalog"
+	"github.com/beckn/catalog-core/pkg/catalog/store"
+	"github.com/beckn/catalog-core/pkg/security/artifactsigner"
 )
 
 // defaultFileValidity is the fallback used for a catalog file's own

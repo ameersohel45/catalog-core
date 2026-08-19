@@ -30,7 +30,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/beckn/catalog-core/catalog"
+	"github.com/beckn/catalog-core/pkg/catalog"
 )
 
 // ErrBlobNotFound is the sentinel a BlobStore.Get implementation must

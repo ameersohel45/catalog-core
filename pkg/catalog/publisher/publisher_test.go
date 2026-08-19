@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/beckn/catalog-core/catalog"
-	"github.com/beckn/catalog-core/catalog/store"
+	"github.com/beckn/catalog-core/pkg/catalog"
+	"github.com/beckn/catalog-core/pkg/catalog/store"
 )
 
 func testSigningKey(t *testing.T) (ed25519.PrivateKey, string) {

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/beckn/catalog-core/catalog/store"
+	"github.com/beckn/catalog-core/pkg/catalog/store"
 )
 
 // fakeBlobStore is an in-memory store.BlobStore, standing in for any real

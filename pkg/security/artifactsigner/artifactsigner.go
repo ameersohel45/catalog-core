@@ -14,7 +14,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/beckn/catalog-core/security/artifactverifier"
+	"github.com/beckn/catalog-core/pkg/security/artifactverifier"
 )
 
 // dediJWSHeader must match artifactverifier's, byte for byte -- the
