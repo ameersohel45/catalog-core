@@ -14,7 +14,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/beckn/catalog-core/pkg/crawler"
+	"github.com/beckn/catalog-core/pkg/catalog/crawler"
 )
 
 // FaultGap classifies a continuity break in a catalog's change-file chain

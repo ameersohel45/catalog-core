@@ -10,7 +10,7 @@ import (
 	"io"
 	"strings"
 
-	"github.com/beckn/catalog-core/pkg/crawler"
+	"github.com/beckn/catalog-core/pkg/catalog/crawler"
 )
 
 // decoder turns already-digest-verified artifact bytes into a reader over the

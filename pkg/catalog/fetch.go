@@ -18,8 +18,8 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/beckn/catalog-core/pkg/crawler"
-	"github.com/beckn/catalog-core/pkg/crawler/decode"
+	"github.com/beckn/catalog-core/pkg/catalog/crawler"
+	"github.com/beckn/catalog-core/pkg/catalog/crawler/decode"
 )
 
 // supportedCanonicalization is the one FileSignature.Canonicalization value

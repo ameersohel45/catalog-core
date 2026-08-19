@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/beckn/catalog-core/pkg/crawler"
+	"github.com/beckn/catalog-core/pkg/catalog/crawler"
 )
 
 func changeDoc(t *testing.T, upsertID string) []byte {

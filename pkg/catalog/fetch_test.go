@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/beckn/catalog-core/pkg/crawler"
+	"github.com/beckn/catalog-core/pkg/catalog/crawler"
 	"github.com/beckn/catalog-core/pkg/security/artifactsigner"
 )
 

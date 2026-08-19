@@ -9,7 +9,7 @@ import (
 	"compress/gzip"
 	"io"
 
-	"github.com/beckn/catalog-core/pkg/crawler"
+	"github.com/beckn/catalog-core/pkg/catalog/crawler"
 )
 
 func gzipDecoder(b []byte) (io.ReadCloser, error) {

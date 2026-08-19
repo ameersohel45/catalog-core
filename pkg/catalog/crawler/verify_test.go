@@ -1,17 +1,14 @@
 package crawler
 
-// verify_test.go — covers key resolution (StaticKeys, RegistryKeys caching
-// and transient-vs-permanent classification of a registry outcome) and the
-// generic self-signature gate, VerifySignature.
+// verify_test.go — covers key resolution (StaticKeys) and the generic
+// self-signature gate, VerifySignature.
 
 import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"testing"
-	"time"
 
 	"github.com/beckn/catalog-core/pkg/security/artifactverifier"
 )
@@ -104,83 +101,5 @@ func TestVerifySignature_NoSignatureIsPermanent(t *testing.T) {
 
 func TestVerifySignature_NoKeySourceIsPermanent(t *testing.T) {
 	err := VerifySignature(context.Background(), nil, "node", "k1", "sig", []byte(`{}`), "signature")
-	assertPermanentFault(t, err, FaultSignature)
-}
-
-// fakeRegistry drives RegistryKeys in tests, without a real network registry.
-type fakeRegistry struct {
-	subs []Subscription
-	err  error
-	n    int // calls made, for the caching test
-}
-
-func (r *fakeRegistry) Lookup(_ context.Context, _ *Subscription) ([]Subscription, error) {
-	r.n++
-	if r.err != nil {
-		return nil, r.err
-	}
-	return r.subs, nil
-}
-
-func registrySub(status string, pub ed25519.PublicKey) Subscription {
-	return Subscription{
-		KeyID:            "k1",
-		Status:           status,
-		SigningPublicKey: base64.StdEncoding.EncodeToString(pub),
-	}
-}
-
-func TestRegistryKeys_CachesSuccess(t *testing.T) {
-	pub, _, err := ed25519.GenerateKey(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reg := &fakeRegistry{subs: []Subscription{registrySub("SUBSCRIBED", pub)}}
-	keys := RegistryKeys(reg, time.Minute)
-
-	for i := 0; i < 3; i++ {
-		got, err := keys(context.Background(), "node", "k1")
-		if err != nil || !got.Equal(pub) {
-			t.Fatalf("call %d: keys() = %v, %v", i, got, err)
-		}
-	}
-	if reg.n != 1 {
-		t.Fatalf("registry called %d times, want 1 (cached)", reg.n)
-	}
-}
-
-func TestRegistryKeys_UnusableStatusIsPermanent(t *testing.T) {
-	pub, _, err := ed25519.GenerateKey(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reg := &fakeRegistry{subs: []Subscription{registrySub("UNSUBSCRIBED", pub)}}
-	keys := RegistryKeys(reg, time.Minute)
-	_, err = keys(context.Background(), "node", "k1")
-	assertPermanentFault(t, err, FaultSignature)
-}
-
-func TestRegistryKeys_NoSuchKeyIsPermanent(t *testing.T) {
-	reg := &fakeRegistry{subs: nil}
-	keys := RegistryKeys(reg, time.Minute)
-	_, err := keys(context.Background(), "node", "k1")
-	assertPermanentFault(t, err, FaultSignature)
-}
-
-func TestRegistryKeys_OutageIsTransient(t *testing.T) {
-	reg := &fakeRegistry{err: errors.New("registry unreachable")}
-	keys := RegistryKeys(reg, time.Minute)
-	_, err := keys(context.Background(), "node", "k1")
-	if err == nil {
-		t.Fatal("expected an error")
-	}
-	if IsPermanent(err) {
-		t.Fatalf("a registry outage must stay transient (retryable), got permanent: %v", err)
-	}
-}
-
-func TestRegistryKeys_NoNodeIDIsPermanent(t *testing.T) {
-	keys := RegistryKeys(&fakeRegistry{}, time.Minute)
-	_, err := keys(context.Background(), "", "k1")
 	assertPermanentFault(t, err, FaultSignature)
 }

@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/beckn/catalog-core/pkg/catalog"
-	"github.com/beckn/catalog-core/pkg/crawler"
+	"github.com/beckn/catalog-core/pkg/catalog/crawler"
 )
 
 // DefaultRetryDelay is how long SyncNext waits before a transiently-failed

@@ -10,7 +10,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/beckn/catalog-core/pkg/crawler"
+	"github.com/beckn/catalog-core/pkg/catalog/crawler"
 )
 
 func gz(t *testing.T, b []byte) []byte {

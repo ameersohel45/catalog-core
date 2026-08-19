@@ -19,8 +19,8 @@ import (
 	"time"
 
 	"github.com/beckn/catalog-core/pkg/catalog"
+	"github.com/beckn/catalog-core/pkg/catalog/crawler"
 	"github.com/beckn/catalog-core/pkg/catalog/crawlmanager"
-	"github.com/beckn/catalog-core/pkg/crawler"
 	"github.com/beckn/catalog-core/pkg/security/artifactsigner"
 )
 
