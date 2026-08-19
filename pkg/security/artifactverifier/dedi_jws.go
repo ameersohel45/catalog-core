@@ -102,6 +102,27 @@ func VerifyDetachedJWS(doc []byte, jws string, pub ed25519.PublicKey) error {
 	return nil
 }
 
+// VerifyJSON verifies the file spec's self-signing convention: a plain
+// Ed25519 signature over the JCS canonicalization of doc with excludeField
+// removed (the matching counterpart to artifactsigner.SignJSON). Used for
+// both self-signed catalog files/change files and self-signed catalog-index
+// entries -- both sign "the document with `signature` removed", never a
+// derived tuple.
+func VerifyJSON(doc []byte, excludeField, sigValueB64 string, pub ed25519.PublicKey) error {
+	sig, err := base64.StdEncoding.DecodeString(sigValueB64)
+	if err != nil {
+		return fmt.Errorf("decoding signature: %w", err)
+	}
+	canonical, err := CanonicalizeJCSExcluding(doc, excludeField)
+	if err != nil {
+		return err
+	}
+	if !ed25519.Verify(pub, canonical, sig) {
+		return fmt.Errorf("Ed25519 signature verification failed")
+	}
+	return nil
+}
+
 // VerifyFileTuple verifies a catalog-index file entry's per-entry
 // signature: a plain Ed25519 signature over the JCS-canonicalized tuple
 // {catalogId, version, url, digest, validUntil} (file spec, "The signed
