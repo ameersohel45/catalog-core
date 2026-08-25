@@ -19,6 +19,10 @@ import (
 // item is eligible for another claim, when Params.RetryDelay is unset.
 const DefaultRetryDelay = time.Minute
 
+// DefaultMaxParkCount is how many RequeueOrAbandonParked sweeps a parked
+// catalog gets before being abandoned, when Params.MaxParkCount is unset.
+const DefaultMaxParkCount = 12
+
 // Params are CrawlManager's injected collaborators.
 type Params struct {
 	Fetcher *catalog.Fetcher // fixed -- the one correct fetch/verify/decode
@@ -39,6 +43,16 @@ type Params struct {
 	// this, a permanently-unreachable-but-technically-transient host (DNS
 	// gone, host decommissioned) retries forever. 0 => unlimited (no cap).
 	MaxAttempts int
+	// MaxParkCount caps how many times RequeueOrAbandonParked will revive a
+	// given parked catalog before abandoning it instead -- the wrapper
+	// service configures this once here rather than passing it at every
+	// RequeueOrAbandonParked call. 0 => DefaultMaxParkCount. Use the
+	// package-level DeriveMaxParkCount helper to compute this from the
+	// cadence the wrapper actually runs RequeueOrAbandonParked at and the
+	// total retry budget it wants to give a parked catalog (e.g.
+	// DeriveMaxParkCount(5*time.Minute, 4*time.Hour) for a 5-minute sweep
+	// cadence and a 4-hour budget).
+	MaxParkCount int
 	// ResolveBppURI resolves a publishing node's own registered URL, for
 	// backstopping catalog.bppUri on resolved content that doesn't already
 	// carry it (catalog.StampIdentity) -- distinct from key resolution
@@ -69,6 +83,38 @@ func (p Params) retryDelay() time.Duration {
 		return p.RetryDelay
 	}
 	return DefaultRetryDelay
+}
+
+func (p Params) maxParkCount() int {
+	if p.MaxParkCount > 0 {
+		return p.MaxParkCount
+	}
+	return DefaultMaxParkCount
+}
+
+// DeriveMaxParkCount computes a value for Params.MaxParkCount, given the
+// cadence a caller runs RequeueOrAbandonParked at (sweepInterval) and how
+// long they want to keep retrying a parked catalog in total
+// (maxRetryDuration) -- e.g. a 5-minute sweep cadence and a 4-hour total
+// retry budget yields 48. Named Derive-, distinctly from Params.MaxParkCount
+// itself, so a call site (crawlmanager.DeriveMaxParkCount(...)) can't be
+// misread as a struct literal for the field it's meant to feed.
+//
+// The returned threshold is compared with >= against a catalog's
+// cumulative park count (see Store.RequeueOrAbandonParked), so the catalog
+// is actually revived maxParkCount-1 times before the maxParkCount'th park
+// abandons it outright -- a return value of 1 means no revivals at all,
+// abandoning on the very first park. Always at least 1, so a
+// misconfigured (zero or negative) sweepInterval still abandons eventually
+// rather than never.
+func DeriveMaxParkCount(sweepInterval, maxRetryDuration time.Duration) int {
+	if sweepInterval <= 0 {
+		return 1
+	}
+	if n := int(maxRetryDuration / sweepInterval); n > 1 {
+		return n
+	}
+	return 1
 }
 
 // PollIndexes discovers index URLs via Source, conditionally fetches each
@@ -169,8 +215,11 @@ func (p Params) decideCatalog(ctx context.Context, ref IndexRef, entry catalog.C
 // SyncNext claims one queued item from Store, resolves that catalog's
 // current content, and hands it to Sink. It settles the claim before
 // returning: Complete on success, Reschedule on a transient failure, Park
-// on a permanent one (crawler.IsPermanent). Returns claimed=false when the
-// queue was empty -- a caller loops on this to drain the queue.
+// on a permanent one (crawler.IsPermanent) or once a transient one has
+// exhausted MaxAttempts. Park is not the end of the line by itself --
+// RequeueOrAbandonParked, run on its own separate cadence, is what later
+// revives or abandons a parked item. Returns claimed=false when the queue
+// was empty -- a caller loops on this to drain the queue.
 func (p Params) SyncNext(ctx context.Context) (claimed bool, err error) {
 	item, err := p.Store.ClaimNext(ctx)
 	if err != nil {
@@ -207,6 +256,33 @@ func (p Params) SyncNext(ctx context.Context) (claimed bool, err error) {
 		return true, fmt.Errorf("crawlmanager: rescheduling %s: %w", item.CatalogID, err)
 	}
 	return true, syncErr
+}
+
+// RequeueOrAbandonParked drives Store.RequeueOrAbandonParked and logs the
+// outcome, using Params.MaxParkCount (DefaultMaxParkCount if unset) as the
+// abandon threshold. Run this on its own slow, independent cadence --
+// separate from PollIndexes/SyncNext -- so a catalog that parked keeps
+// getting another chance without needing its publisher to republish, while
+// one that keeps failing past MaxParkCount stops retrying forever and
+// becomes visible via ListAbandoned instead of silently retrying, or
+// silently never retrying, forever.
+func (p Params) RequeueOrAbandonParked(ctx context.Context, olderThan time.Duration) error {
+	maxParkCount := p.maxParkCount()
+	revived, abandoned, err := p.Store.RequeueOrAbandonParked(ctx, olderThan, maxParkCount)
+	if err != nil {
+		return fmt.Errorf("crawlmanager: requeuing parked catalogs: %w", err)
+	}
+	if revived > 0 || abandoned > 0 {
+		p.log().InfoContext(ctx, "crawlmanager: parked catalog sweep", "revived", revived, "abandoned", abandoned, "olderThan", olderThan, "maxParkCount", maxParkCount)
+	}
+	return nil
+}
+
+// ListAbandoned returns every catalog RequeueOrAbandonParked has given up
+// on, for an operator surface to review -- crawlmanager itself never reads
+// this back or acts on it again.
+func (p Params) ListAbandoned(ctx context.Context) ([]AbandonedCatalog, error) {
+	return p.Store.ListAbandoned(ctx)
 }
 
 // syncOne dispatches a claimed item to its op: OpRetire wipes the catalog

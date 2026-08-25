@@ -100,6 +100,21 @@ type PassReport struct {
 	At            time.Time
 }
 
+// AbandonedCatalog is one catalog RequeueOrAbandonParked gave up on after
+// it kept being parked past maxParkCount -- exposed via ListAbandoned
+// purely for operator visibility (a dashboard, a CLI, alerting). Nothing
+// in crawlmanager itself ever reads this back or re-acts on it; a Store is
+// free to return an empty slice from ListAbandoned if it doesn't track
+// this detail -- whether to surface it is left to each consumer.
+type AbandonedCatalog struct {
+	CatalogID     string
+	IndexURL      string
+	ParticipantID string
+	ParkCount     int
+	LastError     string
+	AbandonedAt   time.Time
+}
+
 // Op names what SyncNext should do with a queued item.
 type Op string
 
@@ -156,11 +171,70 @@ type Store interface {
 	GetIndexCursor(ctx context.Context, indexURL string) (*IndexCursor, error)
 	UpsertIndexCursor(ctx context.Context, cursor IndexCursor) error
 
+	// Enqueue upserts item into the queue, coalescing a duplicate
+	// CatalogID into whatever row already exists for it rather than
+	// creating a second one -- this is what reactivates a Parked row when
+	// decideCatalog re-enqueues a catalog whose index entry changed while
+	// it sat parked. Because of that, a Store implementation must define
+	// the same coalescing outcome for the race between Enqueue (called
+	// from decideCatalog, on a publisher republish) and
+	// RequeueOrAbandonParked (called from the caller's own separate
+	// sweep) landing on the same still-Parked row at close to the same
+	// time -- e.g. by making both a single conditional UPDATE (or
+	// UPSERT ... ON CONFLICT) against that row rather than a read-then-
+	// write, so whichever commits first simply wins and the other is a
+	// no-op against the now-Queued row, instead of double-queuing or
+	// losing an update.
 	Enqueue(ctx context.Context, item QueueItem) error
 	// ClaimNext claims and returns the next queued item, or nil if the
-	// queue is empty.
+	// queue is empty. A Parked or Abandoned item is never claimable --
+	// only RequeueOrAbandonParked moves a Parked item back to Queued.
 	ClaimNext(ctx context.Context) (*ClaimedItem, error)
 	Complete(ctx context.Context, id, claimID string, cursor CatalogCursor) error
 	Reschedule(ctx context.Context, id, claimID string, nextAttemptAt time.Time) error
+	// Park moves a claimed item to Parked status (not claimable by
+	// ClaimNext) and increments that item's own cumulative park count --
+	// Store's bookkeeping, not exposed on ClaimedItem/QueueItem, since
+	// only RequeueOrAbandonParked ever needs to read it back. Park is not
+	// terminal by itself: RequeueOrAbandonParked is what eventually
+	// revives or abandons a parked item.
 	Park(ctx context.Context, id, claimID string) error
+
+	// RequeueOrAbandonParked sweeps every item that has been sitting in
+	// Parked status for at least olderThan and, for each: if its
+	// cumulative park count is below maxParkCount, moves it back to
+	// Queued (so SyncNext claims and retries it again) and resets its
+	// attempts counter for a fresh MaxAttempts budget; otherwise moves it
+	// to a terminal Abandoned status, permanently excluded from
+	// ClaimNext and from future sweeps. Both outcomes are decided in one
+	// sweep against the same aging rule so they can't drift apart.
+	//
+	// This is the fix for a catalog that parks and then never gets
+	// another chance: PollIndexes only re-examines a catalog when its
+	// publisher actually republishes a changed index (a 304 short-
+	// circuits the whole per-entry decide loop, and even a full decide
+	// finds nothing new if the declared version never moved) -- so a
+	// transient failure whose underlying cause clears on its own (a
+	// dangling file becomes fetchable again, DNS recovers) would
+	// otherwise sit parked forever with nothing to re-trigger it.
+	//
+	// A caller drives this on its own slow, independent cadence (e.g.
+	// once an hour) -- separate from and unrelated to how often
+	// PollIndexes/SyncNext run; crawlmanager owns no scheduler itself.
+	// See DeriveMaxParkCount for computing maxParkCount from that cadence
+	// and a total retry budget.
+	//
+	// This can race against Enqueue landing on the same still-Parked row
+	// (see Enqueue's own doc) -- a Store implementation must resolve that
+	// race the same way Enqueue does, rather than treating this sweep as
+	// the only writer of Parked rows.
+	RequeueOrAbandonParked(ctx context.Context, olderThan time.Duration, maxParkCount int) (revived, abandoned int, err error)
+
+	// ListAbandoned returns every catalog currently in Abandoned status,
+	// for an operator surface to review and decide whether to
+	// investigate or manually re-trigger. Purely a read for visibility --
+	// crawlmanager never calls this itself. A Store may return an empty
+	// slice unconditionally if it doesn't implement abandonment detail;
+	// whether to surface this is each consumer's own call.
+	ListAbandoned(ctx context.Context) ([]AbandonedCatalog, error)
 }

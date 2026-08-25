@@ -188,15 +188,24 @@ func (f *fakeSink) Send(_ context.Context, entry catalog.CatalogEntry, content [
 	return crawlmanager.SinkOutcome{Accepted: true}, nil
 }
 
+type parkedEntry struct {
+	item      crawlmanager.ClaimedItem
+	parkCount int
+	parkedAt  time.Time
+	lastErr   string
+}
+
 type fakeStore struct {
-	mu       sync.Mutex
-	cursors  map[string]crawlmanager.CatalogCursor
-	indexes  map[string]crawlmanager.IndexCursor
-	queue    []crawlmanager.ClaimedItem
-	claimed  map[string]crawlmanager.ClaimedItem // id -> item, held between ClaimNext and settle
-	failures []crawlmanager.PassReport
-	parked   map[string]bool
-	nextID   int
+	mu        sync.Mutex
+	cursors   map[string]crawlmanager.CatalogCursor
+	indexes   map[string]crawlmanager.IndexCursor
+	queue     []crawlmanager.ClaimedItem
+	claimed   map[string]crawlmanager.ClaimedItem // id -> item, held between ClaimNext and settle
+	failures  []crawlmanager.PassReport
+	parked    map[string]*parkedEntry // id -> entry, held while Parked
+	abandoned []crawlmanager.AbandonedCatalog
+	now       func() time.Time
+	nextID    int
 }
 
 func newFakeStore() *fakeStore {
@@ -204,7 +213,8 @@ func newFakeStore() *fakeStore {
 		cursors: map[string]crawlmanager.CatalogCursor{},
 		indexes: map[string]crawlmanager.IndexCursor{},
 		claimed: map[string]crawlmanager.ClaimedItem{},
-		parked:  map[string]bool{},
+		parked:  map[string]*parkedEntry{},
+		now:     time.Now,
 	}
 }
 
@@ -220,6 +230,17 @@ func (s *fakeStore) RecordFailure(_ context.Context, report crawlmanager.PassRep
 	defer s.mu.Unlock()
 	s.failures = append(s.failures, report)
 	return nil
+}
+
+// lastError returns catalogID's most recently recorded failure, for
+// stamping onto a parkedEntry -- must be called with s.mu already held.
+func (s *fakeStore) lastError(catalogID string) string {
+	for i := len(s.failures) - 1; i >= 0; i-- {
+		if s.failures[i].CatalogID == catalogID {
+			return s.failures[i].Error
+		}
+	}
+	return ""
 }
 
 func (s *fakeStore) GetCatalogEnvelope(_ context.Context, catalogID string) (descriptor, provider json.RawMessage, catalogType, participantID string, ok bool, err error) {
@@ -293,9 +314,50 @@ func (s *fakeStore) Reschedule(_ context.Context, id, claimID string, at time.Ti
 func (s *fakeStore) Park(_ context.Context, id, _ string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	item := s.claimed[id]
 	delete(s.claimed, id)
-	s.parked[id] = true
+	entry, ok := s.parked[id]
+	if !ok {
+		entry = &parkedEntry{item: item}
+	}
+	entry.parkCount++
+	entry.parkedAt = s.now()
+	entry.lastErr = s.lastError(item.CatalogID)
+	s.parked[id] = entry
 	return nil
+}
+
+func (s *fakeStore) RequeueOrAbandonParked(_ context.Context, olderThan time.Duration, maxParkCount int) (revived, abandoned int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	for id, entry := range s.parked {
+		if now.Sub(entry.parkedAt) < olderThan {
+			continue
+		}
+		delete(s.parked, id)
+		if entry.parkCount >= maxParkCount {
+			s.abandoned = append(s.abandoned, crawlmanager.AbandonedCatalog{
+				CatalogID: entry.item.CatalogID, IndexURL: entry.item.IndexURL, ParticipantID: entry.item.ParticipantID,
+				ParkCount: entry.parkCount, LastError: entry.lastErr, AbandonedAt: now,
+			})
+			abandoned++
+			continue
+		}
+		revivedItem := entry.item
+		revivedItem.Attempts = 0
+		s.queue = append(s.queue, revivedItem)
+		revived++
+	}
+	return revived, abandoned, nil
+}
+
+func (s *fakeStore) ListAbandoned(context.Context) ([]crawlmanager.AbandonedCatalog, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]crawlmanager.AbandonedCatalog, len(s.abandoned))
+	copy(out, s.abandoned)
+	return out, nil
 }
 
 func itoa(n int) string {
@@ -745,6 +807,150 @@ func TestSyncNext_ParksAfterMaxAttempts(t *testing.T) {
 	}
 	if len(store.queue) != 0 {
 		t.Fatalf("queue = %+v, want empty (parked, not rescheduled)", store.queue)
+	}
+}
+
+// TestRequeueOrAbandonParked_RevivesBelowThreshold proves a parked catalog
+// under maxParkCount is moved back to Queued (with Attempts reset) once
+// it's aged past olderThan, rather than sitting parked forever.
+func TestRequeueOrAbandonParked_RevivesBelowThreshold(t *testing.T) {
+	store := newFakeStore()
+	fixedNow := time.Now()
+	store.now = func() time.Time { return fixedNow }
+	p := crawlmanager.Params{Store: store, MaxParkCount: 3}
+	ctx := context.Background()
+
+	if err := store.Park(ctx, "item-1", "claim"); err != nil {
+		t.Fatal(err)
+	}
+	store.parked["item-1"].item = crawlmanager.ClaimedItem{QueueItem: crawlmanager.QueueItem{CatalogID: "p/c"}, ID: "item-1", Attempts: 2}
+
+	store.now = func() time.Time { return fixedNow.Add(time.Hour) }
+	if err := p.RequeueOrAbandonParked(ctx, 30*time.Minute); err != nil {
+		t.Fatalf("RequeueOrAbandonParked: %v", err)
+	}
+	if len(store.parked) != 0 {
+		t.Fatalf("parked = %v, want revived out of Parked", store.parked)
+	}
+	if len(store.queue) != 1 || store.queue[0].CatalogID != "p/c" || store.queue[0].Attempts != 0 {
+		t.Fatalf("queue = %+v, want p/c revived with Attempts reset to 0", store.queue)
+	}
+	abandoned, err := p.ListAbandoned(ctx)
+	if err != nil || len(abandoned) != 0 {
+		t.Fatalf("ListAbandoned = %+v, %v, want none abandoned", abandoned, err)
+	}
+}
+
+// TestRequeueOrAbandonParked_TooYoungIsNotSwept proves a catalog parked
+// more recently than olderThan is left alone -- neither revived nor
+// abandoned -- so a sweep run right after a Park doesn't immediately undo
+// it.
+func TestRequeueOrAbandonParked_TooYoungIsNotSwept(t *testing.T) {
+	store := newFakeStore()
+	fixedNow := time.Now()
+	store.now = func() time.Time { return fixedNow }
+	p := crawlmanager.Params{Store: store, MaxParkCount: 3}
+	ctx := context.Background()
+
+	if err := store.Park(ctx, "item-1", "claim"); err != nil {
+		t.Fatal(err)
+	}
+	store.parked["item-1"].item = crawlmanager.ClaimedItem{QueueItem: crawlmanager.QueueItem{CatalogID: "p/c"}, ID: "item-1"}
+
+	// Sweep runs immediately after Park, well inside olderThan -- nothing
+	// should move yet.
+	store.now = func() time.Time { return fixedNow.Add(time.Minute) }
+	if err := p.RequeueOrAbandonParked(ctx, 30*time.Minute); err != nil {
+		t.Fatalf("RequeueOrAbandonParked: %v", err)
+	}
+	if len(store.parked) != 1 {
+		t.Fatalf("parked = %v, want the item left parked (too young to sweep)", store.parked)
+	}
+	if len(store.queue) != 0 {
+		t.Fatalf("queue = %+v, want nothing revived yet", store.queue)
+	}
+	if abandoned, err := p.ListAbandoned(ctx); err != nil || len(abandoned) != 0 {
+		t.Fatalf("ListAbandoned = %+v, %v, want none abandoned yet", abandoned, err)
+	}
+}
+
+// TestRequeueOrAbandonParked_AbandonsAtThreshold proves a catalog that has
+// already been parked maxParkCount times is moved to Abandoned instead of
+// revived again, and is surfaced via ListAbandoned.
+func TestRequeueOrAbandonParked_AbandonsAtThreshold(t *testing.T) {
+	store := newFakeStore()
+	fixedNow := time.Now()
+	store.now = func() time.Time { return fixedNow }
+	p := crawlmanager.Params{Store: store, MaxParkCount: 3}
+	ctx := context.Background()
+
+	item := crawlmanager.ClaimedItem{QueueItem: crawlmanager.QueueItem{CatalogID: "p/c", IndexURL: "https://idx.test"}, ID: "item-1"}
+	store.claimed["item-1"] = item
+	if err := store.RecordFailure(ctx, crawlmanager.PassReport{CatalogID: "p/c", Error: "still down"}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		store.claimed["item-1"] = item
+		if err := store.Park(ctx, "item-1", "claim"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	store.now = func() time.Time { return fixedNow.Add(time.Hour) }
+	if err := p.RequeueOrAbandonParked(ctx, 30*time.Minute); err != nil {
+		t.Fatalf("RequeueOrAbandonParked: %v", err)
+	}
+	if len(store.parked) != 0 {
+		t.Fatalf("parked = %v, want removed from Parked either way", store.parked)
+	}
+	if len(store.queue) != 0 {
+		t.Fatalf("queue = %+v, want nothing revived", store.queue)
+	}
+	abandoned, err := p.ListAbandoned(ctx)
+	if err != nil || len(abandoned) != 1 {
+		t.Fatalf("ListAbandoned = %+v, %v, want exactly one abandoned catalog", abandoned, err)
+	}
+	if abandoned[0].CatalogID != "p/c" || abandoned[0].ParkCount != 3 || abandoned[0].LastError != "still down" {
+		t.Errorf("unexpected abandoned entry: %+v", abandoned[0])
+	}
+}
+
+// TestRequeueOrAbandonParked_DefaultsMaxParkCount proves an unset
+// Params.MaxParkCount falls back to DefaultMaxParkCount rather than 0
+// (which would abandon every parked item on its very first sweep).
+func TestRequeueOrAbandonParked_DefaultsMaxParkCount(t *testing.T) {
+	store := newFakeStore()
+	fixedNow := time.Now()
+	store.now = func() time.Time { return fixedNow }
+	p := crawlmanager.Params{Store: store} // MaxParkCount left unset
+	ctx := context.Background()
+
+	if err := store.Park(ctx, "item-1", "claim"); err != nil {
+		t.Fatal(err)
+	}
+	store.parked["item-1"].item = crawlmanager.ClaimedItem{QueueItem: crawlmanager.QueueItem{CatalogID: "p/c"}, ID: "item-1"}
+
+	store.now = func() time.Time { return fixedNow.Add(time.Hour) }
+	if err := p.RequeueOrAbandonParked(ctx, 30*time.Minute); err != nil {
+		t.Fatalf("RequeueOrAbandonParked: %v", err)
+	}
+	if len(store.queue) != 1 {
+		t.Fatalf("queue = %+v, want the single-parked-instance item revived under DefaultMaxParkCount (%d)", store.queue, crawlmanager.DefaultMaxParkCount)
+	}
+	if abandoned, err := p.ListAbandoned(ctx); err != nil || len(abandoned) != 0 {
+		t.Fatalf("ListAbandoned = %+v, %v, want none abandoned", abandoned, err)
+	}
+}
+
+func TestDeriveMaxParkCount(t *testing.T) {
+	if got := crawlmanager.DeriveMaxParkCount(5*time.Minute, 4*time.Hour); got != 48 {
+		t.Errorf("DeriveMaxParkCount(5m, 4h) = %d, want 48", got)
+	}
+	if got := crawlmanager.DeriveMaxParkCount(time.Hour, 30*time.Minute); got != 1 {
+		t.Errorf("DeriveMaxParkCount(1h, 30m) = %d, want 1 (floor)", got)
+	}
+	if got := crawlmanager.DeriveMaxParkCount(0, time.Hour); got != 1 {
+		t.Errorf("DeriveMaxParkCount(0, 1h) = %d, want 1 (guard against zero interval)", got)
 	}
 }
 
