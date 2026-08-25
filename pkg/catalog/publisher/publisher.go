@@ -79,6 +79,34 @@ type Submission struct {
 	CrawlHint string
 
 	Catalog json.RawMessage
+
+	// Directives carries per-catalog publish controls -- unlike Params'
+	// batch-wide knobs (compaction thresholds, Gzip, PublishLatest,
+	// NextUpdateIn, ...), which apply uniformly across every catalog in a
+	// call, these decide how this one catalog specifically gets
+	// published.
+	Directives PublishDirectives
+}
+
+// PublishDirectives carries per-catalog publish controls a caller sets
+// independently for each Submission, rather than uniformly across a whole
+// Publish call.
+type PublishDirectives struct {
+	// ForceBaseline bypasses diffing against PriorState and always emits
+	// a fresh baseline for this catalog. For a catalog with no prior
+	// state this is a no-op (already the default); for one with prior
+	// state, this is how a caller triggers compaction -- a fresh baseline
+	// at the next version, discarding the accumulated change list.
+	ForceBaseline bool
+
+	// Retire marks this catalogId RETIRED this call instead of
+	// publishing it: a tombstone entry (retiredAt, no isActive/baseline/
+	// changes) replaces whatever was there. Catalog is not required and
+	// is ignored when this is set. This catalogId's prior CatalogType/
+	// NetworkIds/SchemaTypes and EntryVersion still come from
+	// PriorState[id] -- a tombstone keeps those, it only drops
+	// isActive/baseline/changes.
+	Retire bool
 }
 
 // Params is everything one Publish call needs, all as explicit values --
@@ -93,25 +121,9 @@ type Params struct {
 	// Store.LoadCatalogs already reconstructed for the catalogs actually
 	// submitted in Catalogs -- the only way Publish can produce a change
 	// file instead of a fresh baseline. A submitted catalogId absent from
-	// this map is always published as a new baseline, same as when
-	// ForceBaseline is set.
+	// this map is always published as a new baseline, same as when a
+	// submission's Directives.ForceBaseline is set.
 	PriorState map[string]store.CatalogState
-
-	// Retire marks these catalogIds RETIRED this call: a tombstone entry
-	// (retiredAt, no isActive/baseline/changes) replaces whatever was
-	// there. A retired catalogId's prior CatalogType/NetworkIds/
-	// SchemaTypes and EntryVersion still come from PriorState[id] -- a
-	// tombstone keeps those, it only drops isActive/baseline/changes. A
-	// catalogId present in both Retire and Catalogs is published
-	// normally; Retire is ignored for it.
-	Retire []string
-
-	// ForceBaseline bypasses diffing against PriorState and always emits
-	// a fresh baseline. For a catalog with no prior state this is a no-op
-	// (already the default); for one with prior state, this is how a
-	// caller triggers compaction -- a fresh baseline at the next version,
-	// discarding the accumulated change list.
-	ForceBaseline bool
 
 	// CompactionChangeCountThreshold and CompactionSizeRatioThreshold
 	// opt into automatically compacting a catalog's baseline instead of
@@ -123,8 +135,10 @@ type Params struct {
 	//   - CompactionSizeRatioThreshold: compact once the combined size of
 	//     pending change files, divided by the baseline's own size, is at
 	//     least this fraction (e.g. 0.5 for 50%).
-	// Either threshold alone can trigger compaction; ForceBaseline still
-	// always triggers it regardless of these.
+	// Either threshold alone can trigger compaction; a submission's own
+	// Directives.ForceBaseline still always triggers it regardless of
+	// these. Unlike Directives, these thresholds apply uniformly to
+	// every catalog in this call.
 	CompactionChangeCountThreshold int
 	CompactionSizeRatioThreshold   float64
 
@@ -261,8 +275,7 @@ func IndexURL(publicBaseURL string) string {
 // PublishError and skipped; it does not fail the rest of the batch.
 func Publish(ctx context.Context, p Params) (Result, error) {
 	log := p.logger()
-	log.DebugContext(ctx, "catalog/publisher: Publish", "domain", p.Domain, "keyId", p.KeyID,
-		"catalogs", len(p.Catalogs), "retirements", len(p.Retire), "forceBaseline", p.ForceBaseline)
+	log.DebugContext(ctx, "catalog/publisher: Publish", "domain", p.Domain, "keyId", p.KeyID, "catalogs", len(p.Catalogs))
 
 	if len(p.SigningKey) != ed25519.PrivateKeySize {
 		return Result{}, fmt.Errorf("catalog/publisher: invalid signing key (want %d bytes, got %d)", ed25519.PrivateKeySize, len(p.SigningKey))
@@ -284,10 +297,21 @@ func Publish(ctx context.Context, p Params) (Result, error) {
 		result.Publish.NextUpdate = &nextUpdate
 	}
 
-	submitted := make(map[string]bool, len(p.Catalogs))
+	handled := make(map[string]bool, len(p.Catalogs))
 
 	for _, sub := range p.Catalogs {
-		submitted[sub.CatalogID] = true
+		if handled[sub.CatalogID] {
+			continue // first entry for a catalogId in one call wins; later duplicates are ignored
+		}
+		handled[sub.CatalogID] = true
+
+		if sub.Directives.Retire {
+			if err := p.retireOne(ctx, sub.CatalogID, now, fileNextUpdate, &result); err != nil {
+				return result, err
+			}
+			continue
+		}
+
 		if err := validateSubmission(sub); err != nil {
 			log.WarnContext(ctx, "catalog/publisher: submission rejected", "catalogId", sub.CatalogID, "stage", "validate", "reason", err.Error())
 			result.Errors = append(result.Errors, PublishError{CatalogID: sub.CatalogID, Stage: "validate", Reason: err.Error()})
@@ -330,62 +354,62 @@ func Publish(ctx context.Context, p Params) (Result, error) {
 		})
 	}
 
-	tombstoned := make(map[string]bool, len(p.Retire))
-	for _, id := range p.Retire {
-		if submitted[id] || tombstoned[id] {
-			continue // submitting and retiring the same catalogId in one call: submission wins; duplicate retire ids collapse to one tombstone
-		}
-		tombstoned[id] = true
-		prior := p.PriorState[id]
-		raw, err := p.signEntry(catalog.CatalogEntry{
-			CatalogID:    id,
-			EntryVersion: prior.EntryVersion + 1,
-			CatalogType:  prior.CatalogType,
-			NetworkIDs:   prior.NetworkIds,
-			SchemaTypes:  prior.SchemaTypes,
-			RetiredAt:    now.Format(time.RFC3339Nano),
-		})
-		if err != nil {
-			log.ErrorContext(ctx, "catalog/publisher: signing tombstone failed", "catalogId", id, "error", err)
-			return result, fmt.Errorf("catalog/publisher: signing tombstone %q: %w", id, err)
-		}
-		log.DebugContext(ctx, "catalog/publisher: catalog retired", "catalogId", id, "entryVersion", prior.EntryVersion+1, "latestPublished", prior.LatestPublished)
-		update := store.CatalogUpdate{CatalogID: id, SignedEntry: raw}
-
-		// CON-TBD-38: a catalog that had "latest" published needs one
-		// final write to that same stable URL, populating
-		// CatalogFileDoc.retiredAt -- otherwise a consumer that only ever
-		// fetches "latest" directly, never revisiting the index, has no
-		// way to learn the catalog is gone. Independent of today's
-		// PublishLatest: this is cleaning up a file that already exists,
-		// not deciding whether to start publishing a new one.
-		if prior.LatestPublished {
-			if prior.Catalog == nil {
-				log.WarnContext(ctx, "catalog/publisher: cannot write final latest tombstone, prior catalog content missing", "catalogId", id)
-				result.Errors = append(result.Errors, PublishError{
-					CatalogID: id, Stage: "retire",
-					Reason: "LatestPublished is set but PriorState.Catalog is empty; cannot write the final \"latest\" tombstone",
-				})
-			} else {
-				content, err := p.signCatalogFile(id, currentVersion(prior), fileNextUpdate, prior.Catalog, &now)
-				if err != nil {
-					log.ErrorContext(ctx, "catalog/publisher: signing final latest tombstone failed", "catalogId", id, "error", err)
-					return result, fmt.Errorf("catalog/publisher: signing final \"latest\" tombstone %q: %w", id, err)
-				}
-				served, _, _, err := maybeCompress(content, "json", p.Gzip)
-				if err != nil {
-					return result, fmt.Errorf("catalog/publisher: compressing final \"latest\" tombstone %q: %w", id, err)
-				}
-				update.Latest = &store.FileWrite{Content: content, ServedContent: served, Compressed: p.Gzip}
-				log.DebugContext(ctx, "catalog/publisher: wrote final latest tombstone", "catalogId", id)
-			}
-		}
-		result.Publish.Retirements = append(result.Publish.Retirements, update)
-	}
-
 	log.DebugContext(ctx, "catalog/publisher: Publish done", "published", len(result.Publish.Updates),
 		"retired", len(result.Publish.Retirements), "errors", len(result.Errors))
 	return result, nil
+}
+
+// retireOne signs a tombstone entry for id, replacing whatever entry was
+// there -- prior CatalogType/NetworkIds/SchemaTypes/EntryVersion still
+// come from PriorState[id], only isActive/baseline/changes are dropped.
+func (p Params) retireOne(ctx context.Context, id string, now time.Time, fileNextUpdate time.Time, result *Result) error {
+	log := p.logger()
+	prior := p.PriorState[id]
+	raw, err := p.signEntry(catalog.CatalogEntry{
+		CatalogID:    id,
+		EntryVersion: prior.EntryVersion + 1,
+		CatalogType:  prior.CatalogType,
+		NetworkIDs:   prior.NetworkIds,
+		SchemaTypes:  prior.SchemaTypes,
+		RetiredAt:    now.Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		log.ErrorContext(ctx, "catalog/publisher: signing tombstone failed", "catalogId", id, "error", err)
+		return fmt.Errorf("catalog/publisher: signing tombstone %q: %w", id, err)
+	}
+	log.DebugContext(ctx, "catalog/publisher: catalog retired", "catalogId", id, "entryVersion", prior.EntryVersion+1, "latestPublished", prior.LatestPublished)
+	update := store.CatalogUpdate{CatalogID: id, SignedEntry: raw}
+
+	// CON-TBD-38: a catalog that had "latest" published needs one final
+	// write to that same stable URL, populating CatalogFileDoc.retiredAt
+	// -- otherwise a consumer that only ever fetches "latest" directly,
+	// never revisiting the index, has no way to learn the catalog is
+	// gone. Independent of today's PublishLatest: this is cleaning up a
+	// file that already exists, not deciding whether to start publishing
+	// a new one.
+	if prior.LatestPublished {
+		if prior.Catalog == nil {
+			log.WarnContext(ctx, "catalog/publisher: cannot write final latest tombstone, prior catalog content missing", "catalogId", id)
+			result.Errors = append(result.Errors, PublishError{
+				CatalogID: id, Stage: "retire",
+				Reason: "LatestPublished is set but PriorState.Catalog is empty; cannot write the final \"latest\" tombstone",
+			})
+		} else {
+			content, err := p.signCatalogFile(id, currentVersion(prior), fileNextUpdate, prior.Catalog, &now)
+			if err != nil {
+				log.ErrorContext(ctx, "catalog/publisher: signing final latest tombstone failed", "catalogId", id, "error", err)
+				return fmt.Errorf("catalog/publisher: signing final \"latest\" tombstone %q: %w", id, err)
+			}
+			served, _, _, err := maybeCompress(content, "json", p.Gzip)
+			if err != nil {
+				return fmt.Errorf("catalog/publisher: compressing final \"latest\" tombstone %q: %w", id, err)
+			}
+			update.Latest = &store.FileWrite{Content: content, ServedContent: served, Compressed: p.Gzip}
+			log.DebugContext(ctx, "catalog/publisher: wrote final latest tombstone", "catalogId", id)
+		}
+	}
+	result.Publish.Retirements = append(result.Publish.Retirements, update)
+	return nil
 }
 
 // publishOne decides baseline vs. change-file vs. metadata-only vs. no-op
@@ -426,16 +450,18 @@ func (p Params) publishOne(ctx context.Context, sub Submission, prior store.Cata
 		entry.Changes = prior.ChangeFiles
 	}
 
-	// diff/changeCatalog are only meaningful once hasPrior && !ForceBaseline
-	// (an unconditional baseline republish below never needs them);
-	// computed here, ahead of the baseline-vs-change decision, so an
-	// automatic compaction trigger (below) can be gated on
-	// contentChanged -- it must never force a baseline republish on a
-	// call that changed nothing at all content-wise.
+	// diff/changeCatalog are only meaningful once hasPrior &&
+	// !Directives.ForceBaseline (an unconditional baseline republish
+	// below never needs them); computed here, ahead of the
+	// baseline-vs-change decision, so an automatic compaction trigger
+	// (below) can be gated on contentChanged -- it must never force a
+	// baseline republish on a call that changed nothing at all
+	// content-wise.
+	forceBaseline := sub.Directives.ForceBaseline
 	var diff catalog.CatalogDiff
 	var changeCatalog json.RawMessage
 	contentChanged := true
-	if hasPrior && !p.ForceBaseline {
+	if hasPrior && !forceBaseline {
 		var err error
 		diff, changeCatalog, err = catalog.Diff(prior.Catalog, sub.Catalog)
 		if err != nil {
@@ -447,11 +473,11 @@ func (p Params) publishOne(ctx context.Context, sub Submission, prior store.Cata
 			"attributesChanged", changeCatalog != nil, "contentChanged", contentChanged)
 	}
 
-	compactionDue := hasPrior && !p.ForceBaseline && contentChanged && p.compactionDue(ctx, sub.CatalogID, prior)
-	if !hasPrior || p.ForceBaseline || compactionDue {
+	compactionDue := hasPrior && !forceBaseline && contentChanged && p.compactionDue(ctx, sub.CatalogID, prior)
+	if !hasPrior || forceBaseline || compactionDue {
 		reason := "no prior state"
 		switch {
-		case p.ForceBaseline:
+		case forceBaseline:
 			reason = "ForceBaseline"
 		case compactionDue:
 			reason = "compaction threshold reached"

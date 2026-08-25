@@ -529,10 +529,9 @@ func TestPublish_ForceBaseline_KeepsPriorChangesListed(t *testing.T) {
 	}
 
 	result, err := Publish(context.Background(), Params{
-		Catalogs:      []Submission{{CatalogID: "CAT-1", Catalog: cat}},
-		PriorState:    map[string]store.CatalogState{"CAT-1": prior},
-		ForceBaseline: true,
-		SigningKey:    priv, KeyID: keyID, Domain: "example.test",
+		Catalogs:   []Submission{{CatalogID: "CAT-1", Catalog: cat, Directives: PublishDirectives{ForceBaseline: true}}},
+		PriorState: map[string]store.CatalogState{"CAT-1": prior},
+		SigningKey: priv, KeyID: keyID, Domain: "example.test",
 	})
 	if err != nil {
 		t.Fatalf("Publish: %v", err)
@@ -689,7 +688,7 @@ func TestPublish_CompactionThreshold_NeverForcesBaselineOnNoOp(t *testing.T) {
 func TestPublish_Retire_ProducesTombstone(t *testing.T) {
 	priv, keyID := testSigningKey(t)
 	result, err := Publish(context.Background(), Params{
-		Retire:     []string{"CAT-OLD"},
+		Catalogs:   []Submission{{CatalogID: "CAT-OLD", Directives: PublishDirectives{Retire: true}}},
 		SigningKey: priv, KeyID: keyID, Domain: "example.test",
 	})
 	if err != nil {
@@ -719,7 +718,7 @@ func TestPublish_Retire_ProducesTombstone(t *testing.T) {
 func TestPublish_RetireWithPriorState_KeepsMetadataAndBumpsEntryVersion(t *testing.T) {
 	priv, keyID := testSigningKey(t)
 	result, err := Publish(context.Background(), Params{
-		Retire: []string{"CAT-OLD"},
+		Catalogs: []Submission{{CatalogID: "CAT-OLD", Directives: PublishDirectives{Retire: true}}},
 		PriorState: map[string]store.CatalogState{
 			"CAT-OLD": {
 				EntryVersion: 5,
@@ -765,7 +764,7 @@ func TestPublish_RetireWithLatestPublished_WritesFinalTombstone(t *testing.T) {
 	priv, keyID := testSigningKey(t)
 	cat := mustCatalogWithItems("CAT-OLD", "ITEM-1")
 	result, err := Publish(context.Background(), Params{ // PublishLatest deliberately off
-		Retire: []string{"CAT-OLD"},
+		Catalogs: []Submission{{CatalogID: "CAT-OLD", Directives: PublishDirectives{Retire: true}}},
 		PriorState: map[string]store.CatalogState{
 			"CAT-OLD": {
 				Catalog:         cat,
