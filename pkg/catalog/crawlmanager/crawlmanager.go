@@ -321,7 +321,7 @@ func (p Params) sendSupplied(ctx context.Context, item *ClaimedItem) error {
 	}
 
 	cursor := CatalogCursor{
-		CatalogID: item.CatalogID, ParticipantID: item.ParticipantID,
+		CatalogID: item.CatalogID, IndexURL: item.IndexURL, ParticipantID: item.ParticipantID,
 		Descriptor: descriptor, Provider: provider,
 		CatalogType: item.Entry.CatalogType, SyncedAt: p.now(),
 	}
