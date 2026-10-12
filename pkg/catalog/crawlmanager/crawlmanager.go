@@ -285,15 +285,52 @@ func (p Params) ListAbandoned(ctx context.Context) ([]AbandonedCatalog, error) {
 	return p.Store.ListAbandoned(ctx)
 }
 
-// syncOne dispatches a claimed item to its op: OpRetire wipes the catalog
-// from Sink using its captured envelope (a retired index entry carries no
-// content to re-fetch); OpSync (or unset, for a Store predating Op) resolves
-// current content and pushes it.
+// syncOne dispatches a claimed item: OpRetire wipes the catalog from Sink
+// using its captured envelope (a retired index entry carries no content to
+// re-fetch); an item carrying Content is pushed as-is; anything else resolves
+// current content from its index and pushes that.
 func (p Params) syncOne(ctx context.Context, item *ClaimedItem) error {
-	if item.Op == OpRetire {
+	switch {
+	case item.Op == OpRetire:
 		return p.retireOne(ctx, item)
+	case len(item.Content) > 0:
+		return p.sendSupplied(ctx, item)
+	default:
+		return p.syncActive(ctx, item)
 	}
-	return p.syncActive(ctx, item)
+}
+
+// sendSupplied hands content the caller already holds to Sink. Nothing is
+// fetched and no version is tracked -- the cursor exists so the item settles
+// like any other.
+//
+// Identity is NOT stamped: this content came from another node and already
+// names it, and overwriting that would point callers back at us.
+func (p Params) sendSupplied(ctx context.Context, item *ClaimedItem) error {
+	outcome, err := p.Sink.Send(ctx, item.Entry, item.Content)
+	if err != nil {
+		return err
+	}
+	if !outcome.Accepted {
+		return fmt.Errorf("crawlmanager: sink rejected %s: %s", item.CatalogID, outcome.Reason)
+	}
+
+	descriptor, provider, err := catalog.ExtractEnvelope(item.Content)
+	if err != nil {
+		p.log().WarnContext(ctx, "crawlmanager: extracting envelope failed", "catalogId", item.CatalogID, "error", err)
+	}
+
+	cursor := CatalogCursor{
+		CatalogID: item.CatalogID, ParticipantID: item.ParticipantID,
+		Descriptor: descriptor, Provider: provider,
+		CatalogType: item.Entry.CatalogType, SyncedAt: p.now(),
+	}
+	if err := p.Store.Complete(ctx, item.ID, item.ClaimID, cursor); err != nil {
+		return err
+	}
+	p.log().InfoContext(ctx, "crawlmanager: supplied catalog pushed",
+		"catalogId", item.CatalogID, "participantId", item.ParticipantID, "contentBytes", len(item.Content))
+	return nil
 }
 
 // syncActive re-fetches item's index (so it always acts on the catalog's

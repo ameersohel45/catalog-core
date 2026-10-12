@@ -135,6 +135,15 @@ type QueueItem struct {
 	IndexURL      string
 	ParticipantID string
 	Op            Op
+
+	// Content is the catalog itself, when the caller already holds it. A
+	// federated crawl receives catalogs from a discover, so there is no index
+	// to re-fetch them from. Empty means resolve from IndexURL as usual.
+	Content []byte
+
+	// Entry describes Content. Only meaningful alongside it, since an
+	// index-sourced item reads its entry from the index.
+	Entry catalog.CatalogEntry
 }
 
 // ClaimedItem is one QueueItem claimed for processing: id/ClaimID are

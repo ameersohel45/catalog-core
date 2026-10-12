@@ -1005,3 +1005,50 @@ func TestSyncNext_DoesNotOverwritePublisherSuppliedIdentity(t *testing.T) {
 		t.Fatalf("bppId = %v, want the publisher's own value preserved", got["bppId"])
 	}
 }
+
+// A federated crawl receives catalogs from a discover, so there is no index to
+// re-fetch and no files to resolve. The item carries what was received.
+func TestSyncNext_SendsSuppliedContentWithoutFetching(t *testing.T) {
+	store := newFakeStore()
+	sink := newFakeSink()
+	// No Fetcher: reaching one would panic, which is how this proves nothing
+	// was fetched.
+	p := crawlmanager.Params{Sink: sink, Store: store}
+	ctx := context.Background()
+
+	content := []byte(`{"id":"peer/c","descriptor":{"name":"from a peer"}}`)
+	item := crawlmanager.QueueItem{
+		CatalogID:     "peer/c",
+		ParticipantID: "mahavistara.oan.local",
+		Content:       content,
+		Entry: catalog.CatalogEntry{
+			CatalogID:   "peer/c",
+			CatalogType: "REGULAR",
+			NetworkIDs:  []string{"bharatvistar.oan.local"},
+		},
+	}
+	if err := store.Enqueue(ctx, item); err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, err := p.SyncNext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed {
+		t.Fatal("expected an item to be claimed")
+	}
+	if got, ok := sink.got["peer/c"]; !ok {
+		t.Fatalf("sink received %v, want peer/c", sink.got)
+	} else if string(got) != string(content) {
+		t.Fatalf("sink received %s, want the supplied content", got)
+	}
+
+	cursor, seen, err := store.GetCatalogCursor(ctx, "peer/c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !seen || cursor.ParticipantID != "mahavistara.oan.local" {
+		t.Fatalf("cursor = %+v seen=%v, want the peer recorded", cursor, seen)
+	}
+}
